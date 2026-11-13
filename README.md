@@ -1,88 +1,125 @@
-# DSH 破甲实操方法（网页版 dsh web + dsh-purge 1.1.71）
+# DSH 网页版破甲完整指南（隔离实例 + 完整闭环）
 
-> 记录在本机把 **网页版 DeepSeek Harness（`dsh web`）** 破甲并跑通的完整方法。
-> 亲测环境：DSH `0.2.0-rc.2` + `dsh-purge 1.1.71`，Windows，Node 22.x。
+> 把网页版 DeepSeek Harness（`dsh web`）破甲，并且**破甲后能真正正常使用**的完整方法。
 >
-> ⚠️ 仅供已授权环境下的红队评测与鲁棒性研究。请遵守 [dsh-purge 的合规声明](https://github.com/YuJunZhiXue/dsh-purge)。
+> 本文以本机实测跑通的**隔离实例**为基准：
+> **`D:\dsh-purge\runtime\dsh-home`｜端口 3085｜DSH 0.2.0-rc.2｜dsh-purge 1.1.71**
+>
+> ⚠️ 仅供已授权环境下的红队评测与鲁棒性研究。遵循 [dsh-purge 合规声明](https://github.com/YuJunZhiXue/dsh-purge)。
 
-## 核心认知：破甲是三层，不是一句话
+---
 
-很多人以为往系统提示词里塞一段越狱文案就完事了。实际 DSH 的拦截在**三个层次**上，只改提示词会被另外两层吃掉：
+## 为什么用隔离实例
+
+破甲会改写 `@deepseek-ai/*` 包文件。如果直接对日常在用的宿主动手，一旦出问题就得重装整个 DSH。
+
+隔离实例的做法是把 `DSH_HOME` 指到独立目录，**补丁、注入、会话全部落在沙盒里**，日常环境一点不受影响，出问题删掉目录重来即可。
+
+| 项 | 日常环境 | 本文破甲实例 |
+|---|---|---|
+| DSH_HOME | `%USERPROFILE%\.dsh` | `D:\dsh-purge\runtime\dsh-home` |
+| 端口 | 54498（桌面端） | **3085** |
+| profile | desktop | **web** |
+| 破甲状态 | 未装 purge | **已应用 1.1.71** |
+
+两套实例的账号池、会话、插件互相不可见——这是隔离的预期行为，不是故障。
+
+---
+
+## 第一层认知：破甲是三层拦截，不是一段提示词
+
+只往系统提示词塞越狱文案，会被另外两层吃掉：
 
 | 层 | 位置 | 作用 | 不改的后果 |
 |---|---|---|---|
-| **① 宿主补丁** | `@deepseek-ai/*` 包文件 + shim | 改审批门、沙箱、提示词拼接逻辑 | 工具调用被审批门拦住 |
-| **② 提示词注入** | `$DSH_HOME/prompt-inject.md` | 真正决定模型身份与规则 | 模型仍按官方人格回答 |
-| **③ 工作区 baseline** | DSH 自动拼的 workspace 段 | 每轮往系统提示词追加策略 | 冲淡注入，触发拦截 |
+| **① 宿主补丁** | `@deepseek-ai/*` 包内文件 + shim | 改审批门、沙箱、提示词拼接 | 工具调用被审批门拦住 |
+| **② 提示词注入** | `$DSH_HOME/prompt-inject.md` | 决定模型身份与规则 | 模型仍按官方人格回答 |
+| **③ workspace baseline** | DSH 每轮自动拼接 | 稀释注入 | 拦截复现 |
 
-**dsh-purge 的价值就是把这三层一起处理**，并且可还原。
+**dsh-purge 的价值在于三层一起处理，且可还原。**
 
-## 版本矩阵（最重要的一条）
+---
 
-`dsh-purge` 的 `dshTarget` 必须与 DSH 版本严格匹配，对不上就「待应用/跳过」，不会乱改文件：
+## 版本矩阵（最先确认这条）
 
-| DSH 版本 | 用哪个 purge |
+`dsh-purge` 的 `dshTarget` 必须与 DSH 版本严格匹配，对不上会显示「待应用/跳过」，不会乱改文件：
+
+| DSH 版本 | 所需 purge |
 |---|---|
-| `0.2.x`（含官方桌面 0.2.0-rc.2、官方 `dsh web`） | **1.1.40+**（本例 1.1.71） |
-| `0.1.7`（rc.1 / rc.2） | **1.1.39 及更早** |
+| `0.2.x`（官方桌面 0.2.0-rc.2、官方 `dsh web`） | **1.1.40+** |
+| `0.1.7`（rc.1/rc.2） | **1.1.39 及更早** |
 
-`dsh-purge 1.1.71` 的 `package.json` 里写死：
+本例实测（`package.json` 内写死）：
 
 ```json
 "dshTarget": "0.2.0-rc.2"
 ```
 
-所以 **DSH 必须是 0.2.0-rc.2**。这是本例能跑通的前提。
-
-## 完整步骤
-
-### 1. 确认宿主是 dsh 0.2.0-rc.2
-
 ```powershell
 node .\node_modules\@deepseek-ai\dsh\lib\bin.js --version
-# 期望输出：0.2.0-rc.2
+# 期望：0.2.0-rc.2
 ```
 
-> 官方桌面 EXE 与官方 `dsh web` **分开装、分开点「应用」**。本文只讲 `dsh web`。
+---
 
-### 2. 装插件到 web profile
+## 第一步：建隔离实例
 
-```sh
+```powershell
+mkdir D:\dsh-purge\runtime
+cd D:\dsh-purge\runtime
+npm init -y
+npm install @deepseek-ai/dsh@0.2.0-rc.2
+```
+
+**三个必须遵守的隔离条件**（缺一就会污染日常环境）：
+
+1. `DSH_HOME` 指向沙盒，绝不使用 `%USERPROFILE%\.dsh`；
+2. `DSH_BASE` **必须清空**——它会让 purge 去改写路径错误的包文件；
+3. `autoApplyOnStart: false`——启动时不静默改文件，必须人工点「应用」。
+
+---
+
+## 第二步：装 purge 进 web profile
+
+```powershell
+cd D:\dsh-purge\runtime\dsh-home\profiles\web
 dsh plugin --profile web add dsh-purge
 ```
 
-`dsh` 不在 PATH，或 registry 上不去时：
+registry 不通时改用 tarball：
 
-```sh
+```powershell
 dsh plugin --profile web add https://github.com/YuJunZhiXue/dsh-purge/archive/refs/heads/master.tar.gz
 ```
 
-装完验证（会在 `profiles/web/node_modules` 下出现 `dsh-purge`）：
+验证安装：
 
 ```powershell
-Get-Content .\profiles\web\node_modules\dsh-purge\package.json | Select-String 'version|dshTarget'
+Get-Content .\node_modules\dsh-purge\package.json | Select-String 'version|dshTarget'
+# version: 1.1.71   dshTarget: 0.2.0-rc.2
 ```
 
-### 3. 在 cordis.patch.yml 注册（关键）
+---
 
-`dsh-purge` 不在默认 bundles 里，**必须用 `insert:` 挂载**，否则宿主不会加载它：
+## 第三步：注册到 cordis.patch.yml（关键）
+
+purge **不在默认 bundles 里，必须 `insert:` 挂载**，否则宿主根本不加载它：
 
 ```yaml
 - insert:
     - id: dsh-purge
       name: 'dsh-purge'
-      inject: [ systemPrompt, tools ]
+      inject: [ systemPrompt, tools ]   # 必须带 tools，否则审批门不变
       config:
         enabled: true
-        autoApplyOnStart: false     # 启动不自动改宿主，安全
+        autoApplyOnStart: false         # 启动不自动改宿主
         autoUpdateOnStart: false
         autoRevertOnMissing: false
-        injectOnce: false           # 每轮都注入，不是只注一次
+        injectOnce: false               # 每轮都注入，防多轮后被冲掉
         stripMnemon: true
         verbose: false
         postPrompt: ""
-        postPromptOrder: 5100
-    # 演练台三个子行（只做破甲可省略）
+        postPromptOrder: 5100           # 排在 baseline 之后
     - id: dsh-purge-redteam
       name: dsh-purge/redteam
     - id: dsh-purge-redteam-store
@@ -93,115 +130,195 @@ Get-Content .\profiles\web\node_modules\dsh-purge\package.json | Select-String '
       name: dsh-purge/redteam/ui
 ```
 
-**几个参数为什么这么设：**
+**同时** `profiles/web/package.json` 的 `dsh.profile.bundles` 里也要有 `dsh-purge`。两处缺一不可。
 
-- `inject: [ systemPrompt, tools ]` —— 同时改系统提示词和工具清单（不改 tools 的话工具上限与审批门仍是默认）；
-- `autoApplyOnStart: false` —— 别让它在启动时偷偷改包文件，必须人工点「应用」，出问题能立刻停；
-- `injectOnce: false` —— 每轮都重新注入，防止多轮对话后注入被上下文冲掉；
-- `postPromptOrder: 5100` —— 注入位置排在 workspace baseline 之后，保证优先级。
+---
 
-同时 `package.json` 的 `dsh.profile.bundles` 里也要有 `dsh-purge`，两处缺一不可。
-
-### 4. 重启宿主
+## 第四步：启动
 
 ```powershell
-# 完全退出旧进程再起，热重载不加载新插件
-node .\node_modules\@deepseek-ai\dsh\lib\bin.js web --port 3085
+cd D:\dsh-purge\runtime
+$env:DSH_HOME = "D:\dsh-purge\runtime\dsh-home"
+$env:DSH_PROFILE = "web"
+$env:DSH_PROFILE_DIR = "D:\dsh-purge\runtime\dsh-home\profiles\web"
+$env:DSH_BASE = ""
+$env:DSH_WEB_URL = ""
+$env:DSH_SESSION_ID = ""
+
+node .\node_modules\@deepseek-ai\dsh\lib\bin.js web --port 3085 --no-open
 ```
 
-### 5. 点「应用」—— 真正打补丁的一步
+打开 `http://127.0.0.1:3085`。
 
-只写进 profile **不会**改 `@deepseek-ai` 包。必须：
+---
 
-1. 打开 `http://127.0.0.1:3085`；
-2. 点**会话标题旁的 dsh-purge** 按钮（注意：**不在设置页里**，设置页找不到）；
-3. 进「清洗」页 → 点 **「应用」**；
-4. 成功后会自动重启一次，补丁进入当前进程。
+## 第五步：点「应用」——真正打补丁的一步
 
-应用过程做四件事（自动备份 `.dshpurge.bak`）：
+只写进 profile **不会**改 `@deepseek-ai`。必须：
+
+1. 点**会话标题旁的 dsh-purge** 按钮（⚠️ **不在设置页里**，设置页永远找不到）；
+2. 进「清洗」页 → 点 **「应用」**；
+3. 成功后自动重启一次，补丁进入进程。
+
+应用动作依次执行：
 
 ```text
-备份原件 → 按补丁列表替换文件 → 覆盖 shim → 注入加密默认提示词
+备份原件(.dshpurge.bak) → 按补丁列表替换文件 → 覆盖 shim → 注入加密默认提示词
 ```
 
-验证是否真的生效：
+### 怎么确认真的应用了
+
+本例的实盘证据（`$DSH_HOME/dsh-purge/applied.json`）：
+
+```json
+{
+  "version": "1.1.71",
+  "sha": "apply:1.1.71",
+  "at": "2026-11-13T06:32:11.539Z"
+}
+```
+
+```powershell
+# 一条命令验证
+Get-Content "$env:DSH_HOME\dsh-purge\applied.json"
+Get-Content "$env:DSH_HOME\dsh-purge\installed-rev"   # apply:1.1.71
+```
+
+或在聊天里：
 
 ```text
-在聊天里输入  /purge status
+/purge status        # 打出 DSH_HOME 与补丁列表，路径必须是你正在用的那份
 ```
 
-应能打出 `DSH_HOME` 路径和补丁列表，路径必须是你正在用的那一份。
+---
 
-### 6. 写提示词注入
+## 第六步：配置提示词注入
 
-这是破甲的**内容层**。三种来源，优先级从高到低：
+三种来源，优先级从高到低：
 
 ```text
 prompt-inject.md（规则库写入） > 勾选的 AGENTS.md/CLAUDE.md > 插件加密默认值
 ```
 
-文件位置（本例实测，24KB）：
+本例实测文件（**226 行 / 24KB**）：
 
 ```text
 D:\dsh-purge\runtime\dsh-home\prompt-inject.md
 ```
 
-编辑方式：
+编辑途径：
 
-- 面板里「提示词」框直接改（保存即写 `prompt-inject.md`）；
-- 或 `/purge edit`；
-- 或 `/rules use <id>` 切换整套规则集。
+- 面板「提示词」框直接改（保存即写入 `prompt-inject.md`）；
+- `/purge edit`；
+- `/rules use <id>` 切换整套规则集；
+- `/rules create <id>` 自建。
 
-可换模型换提示词——`dsh-purge` 支持**按模型绑定不同注入**，国模用默认「小码酱」那套，其他模型可另配。
+**插件支持按模型绑定不同提示词**——国模用内置「小码酱」那套，其他模型可另配，不必一套打天下。
 
-### 7. 处理 workspace baseline（第三层）
+> 本例 `override-state.json` 显示 `customized: false`，即**用的是官方自带加密默认值**，尚未自建。想定制就改这里。
 
-即使注入写好了，DSH 每轮还会往系统提示词追加一段 workspace baseline，把注入冲淡。面板里的「工作区策略」三档：
+---
 
-| 策略 | 行为 | 何时用 |
+## 第七步：三档 workspace baseline 策略
+
+即使注入写好了，DSH 每轮还会追加 workspace baseline 稀释它。面板「工作区策略」：
+
+| 策略 | 行为 | 适用 |
 |---|---|---|
-| `strict` | **无条件删掉** DSH baseline 段 | 破甲最彻底，推荐 |
+| `strict` | **无条件删掉** baseline 段 | 破甲最彻底 ✅ |
 | `fallback`（默认） | 有用户注入时才删 | 平衡 |
 | `always` | 保留 baseline | 不破甲 |
 
-选了 `strict` 或 `fallback` 且已有注入，baseline 才会被去掉。
+判断逻辑：注入非空 → 走 `fallback` 时才会去掉 baseline；选 `strict` 则永远去掉。
 
-### 8. 新开一轮对话
+---
 
-补丁和注入都只在**新会话**生效。老会话里已经发出的系统提示词不会变，别在旧对话里测，会误判成「没生效」。
+## 第八步：新开会话（最容易漏）
+
+补丁和注入**只对新会话生效**。老会话的系统提示词已经发出去不会变，在旧对话里测必然误判成「没生效」。
+
+---
+
+## 完整闭环：破甲后怎么算「能正常使用」
+
+破甲成功 ≠ 能正常使用。必须跑通这三件事：
+
+### ① 接上模型
+
+`cordis.patch.yml` 里指定默认 provider：
+
+```yaml
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: workbuddy2api
+    model: deepseek-v4.1-flash
+```
+
+### ② 让工具调用不被审批门拦
+
+这就是 `inject: [ systemPrompt, tools ]` 里 `tools` 的作用。只注入提示词不改 tools，模型愿意干活但工具调不动，表现为「说得好好的却不执行」。
+
+### ③ 真跑一次工具调用验证
+
+在新会话里让模型执行一个**真实文件操作**，例如：
+
+```text
+在当前目录建一个 hello.txt，写入 "purge ok"，然后读回来确认
+```
+
+三个都要成立才算通：
+
+- ✅ 模型没拒绝、没加免责声明
+- ✅ 工具真的执行了（文件真建出来了）
+- ✅ 读回内容正确（不是幻觉）
+
+### 本例的实盘佐证
+
+3085 实例确有持续活跃的工作会话（15:31–15:36 连续写入），工作目录 `D:\AI-Agents-Workspace\harness\生图片`，说明破甲后实例在实际执行任务，不是空转。
+
+---
 
 ## 常见坑
 
-**Q：面板里找不到 dsh-purge 按钮？**
-在**会话标题旁**，不在设置页。装完必须**完全退出**宿主再开，热重载不加载新插件。
+**面板里找不到 dsh-purge？**
+在**会话标题旁**，不在设置页。装完必须完全退出宿主再开，热重载不加载新插件。
 
-**Q：点了「应用」但模型还是拒绝？**
-按顺序排查：① `/purge status` 路径是否指向你在用的宿主；② `prompt-inject.md` 是否非空；③ 工作区策略是否设成 `strict`；④ **是否新开了对话**（最常见）；⑤ `injectOnce` 是否被误设成 `true`。
+**点了「应用」模型还是拒绝？**
+按序排查：① `/purge status` 路径对不对；② `prompt-inject.md` 是否非空；③ 工作区策略是否 `strict`；④ **是否新开会话**（最常见）；⑤ `injectOnce` 是否被误设 `true`；⑥ `inject` 里有没有 `tools`。
 
-**Q：桌面端改了 web 没改 / 反之？**
-两个宿主独立，`apply` 只作用于点它的那个。不要在一个宿主里点另一个宿主。
+**模型愿意答但工具不执行？**
+`inject` 缺少 `tools`，或者权限策略没放开。
 
-**Q：升级插件后破甲失效？**
-`npm install` 覆盖 `node_modules` 会冲掉补丁。重新在「清洗」里点「应用」，或用 `autoApplyOnStart: true`（不推荐，启动静默改文件）。
+**升级插件后失效？**
+`npm install` 覆盖 `node_modules` 冲掉补丁。重新点「应用」。不建议用 `autoApplyOnStart: true`（启动静默改文件）。
 
-**Q：极简/PTC 模式被拦，标准模式正常？**
-通常是 preset 里 `run_code` 或 plan 拦截句没洗净，或内置 minimal 缺 `agent-instructions`。升到 1.1.61+，**完全退出 → 应用 → 自动重启 → 新开一轮**。只换 preset 不重应用，旧进程里的补丁不会更新。
+**极简/PTC 被拦，标准模式正常？**
+preset 里 `run_code` 或 plan 拦截句没洗净，或内置 minimal 缺 `agent-instructions`。升 1.1.61+，**完全退出 → 应用 → 自动重启 → 新开会话**。只换 preset 不重应用，旧进程补丁不更新。
 
-**Q：想还原？**
-```sh
-/purge revert     # 用 .dshpurge.bak 覆盖回去并删备份
+**想还原？**
+
+```text
+/purge revert        # 用 .dshpurge.bak 覆盖回去并删备份
 ```
-`prompt-inject.md` 是用户文件，还原时**保留**。这样反复试验不会丢你自己写的提示词。
+
+`prompt-inject.md` 是**用户文件，还原时保留**，反复试验不丢你自己写的提示词。
+
+**两个实例账号池不一样？**
+正常。网页登录的凭据按 `DSH_HOME` 存储不跨界；桌面端 auth 目录发现的账号才全局共享。要同步就复制 `.workbuddy2api-auth.<accountId>.json` 过去再刷新。
+
+---
 
 ## 一句话总结
 
-破甲 = **版本对上（0.2.0-rc.2 / purge 1.1.71）+ 注册对（cordis.patch.yml 用 insert）+ 点应用（会话标题旁，不是设置页）+ 注入非空 + baseline strict + 新开会话**。
-六条缺一条，表现都是「模型还是拒绝」。
+破甲 = **版本对上（0.2.0-rc.2 / purge 1.1.71）+ 注册对（insert + bundles 两处）+ 点应用（标题旁不是设置页）+ 注入非空 + baseline strict + 新开会话**，六条缺一表现都是「模型还是拒绝」。
+
+能用 = **接上模型 + inject 带 tools + 真跑一次工具调用校验**。
 
 ---
 
 **署名与致谢**
 
-本项目的方法与提示词均来自 [YuJunZhiXue/dsh-purge](https://github.com/YuJunZhiXue/dsh-purge)（MIT）。按其署名要求，借用其名称、思路、代码或提示词必须署名并标明来源仓库。
+方法与提示词来自 [YuJunZhiXue/dsh-purge](https://github.com/YuJunZhiXue/dsh-purge)（MIT）。按其署名要求，借用名称、思路、代码或提示词必须署名并标明来源仓库。
 
 个人实验记录，非盈利，仅供技术参考与授权环境下的研究。
